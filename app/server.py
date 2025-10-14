@@ -5,37 +5,24 @@
 #Reads the OpenAPI spec (openapi.yaml)
 
 #Implements all routes
+from flask import Flask
+from flask_cors import CORS
+from . import controllers
 
-from fastapi import FastAPI, HTTPException
+app = Flask(__name__)
+CORS(app)
 
-app = FastAPI(title="Recommendations API", version="1.0.0")
+@app.route("/health", methods=["GET"])
+def health():
+    return controllers.health()
 
-# In-memory mock data
-recommendations_db = {
-    "1": ["Paris", "Tokyo", "Lisbon"]
-}
+@app.route("/recommendations", methods=["POST"])
+def create_recommendations():
+    return controllers.create_recommendations()
 
-@app.post("/recommendations")
-def create_recommendations(preferences: dict):
-    # Normally you'd use preferences to generate recommendations
-    return {"recommendations": ["Paris", "Tokyo", "Lisbon"]}
+@app.route("/recommendations/<recId>", methods=["GET", "PUT", "DELETE"])
+def rec_operations(recId):
+    return controllers.not_implemented(recId)
 
-
-@app.get("/recommendations/{recId}")
-def get_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.put("/recommendations/{recId}")
-def update_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.delete("/recommendations/{recId}")
-def delete_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.get("/health")
-def health_check():
-    return {"status": "OK"}
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

@@ -1,0 +1,96 @@
+openapi: 3.0.0
+info:
+  title: TripSpark Recommendation Service
+  version: 1.0.0
+  description: API for generating personalized travel recommendations
+
+servers:
+  - url: http://localhost:8080
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: OK
+
+  /recommendations:
+    post:
+      summary: Generate travel recommendations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                destination:
+                  type: string
+                  example: New York
+                vibes:
+                  type: array
+                  items:
+                    type: string
+                  example: ["coffee", "museums"]
+                budget:
+                  type: string
+                  enum: [low, medium, high]
+                  example: medium
+      responses:
+        '200':
+          description: List of recommended POIs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    reason:
+                      type: string
+
+  /recommendations/{recId}:
+    get:
+      summary: Get a recommendation by ID
+      parameters:
+        - name: recId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '501':
+          description: Not implemented
+    put:
+      summary: Update a recommendation by ID
+      parameters:
+        - name: recId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '501':
+          description: Not implemented
+    delete:
+      summary: Delete a recommendation by ID
+      parameters:
+        - name: recId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '501':
+          description: Not implemented
