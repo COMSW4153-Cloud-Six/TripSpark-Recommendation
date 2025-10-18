@@ -1,13 +1,6 @@
-#This is to run the service
-
-#Write minimal working Python code using Flask or Connexion that:
-
-#Reads the OpenAPI spec (openapi.yaml)
-
-#Implements all routes
 from flask import Flask
 from flask_cors import CORS
-from . import controllers
+import controllers
 
 app = Flask(__name__)
 CORS(app)

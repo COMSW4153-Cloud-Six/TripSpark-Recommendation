@@ -1,7 +1,7 @@
 #This is to handle API endpoints
 
 from flask import jsonify, request
-from .recommender import get_recommendations
+from recommender import get_recommendations
 
 def health():
     return jsonify({"status": "OK"}), 200
