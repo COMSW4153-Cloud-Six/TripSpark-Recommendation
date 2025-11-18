@@ -1,41 +1,27 @@
-#This is to run the service
+from flask import Flask
+from flask_cors import CORS
+import controllers
+from flask_swagger_ui import get_swaggerui_blueprint
 
-#Write minimal working Python code using Flask or Connexion that:
+app = Flask(__name__)
+CORS(app)
 
-#Reads the OpenAPI spec (openapi.yaml)
+@app.route("/health", methods=["GET"])
+def health():
+    return controllers.health()
 
-#Implements all routes
+@app.route("/recommendations", methods=["POST"])
+def create_recommendations():
+    return controllers.create_recommendations()
 
-from fastapi import FastAPI, HTTPException
+@app.route("/recommendations/<recId>", methods=["GET", "PUT", "DELETE"])
+def rec_operations(recId):
+    return controllers.not_implemented(recId)
 
-app = FastAPI(title="Recommendations API", version="1.0.0")
+SWAGGER_URL = '/docs'
+API_URL = '/static/openapi.yaml'  # save your YAML file here
+swaggerui_blueprint = get_swaggerui_blueprint(SWAGGER_URL, API_URL)
+app.register_blueprint(swaggerui_blueprint, url_prefix=SWAGGER_URL)
 
-# In-memory mock data
-recommendations_db = {
-    "1": ["Paris", "Tokyo", "Lisbon"]
-}
-
-@app.post("/recommendations")
-def create_recommendations(preferences: dict):
-    # Normally you'd use preferences to generate recommendations
-    return {"recommendations": ["Paris", "Tokyo", "Lisbon"]}
-
-
-@app.get("/recommendations/{recId}")
-def get_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.put("/recommendations/{recId}")
-def update_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.delete("/recommendations/{recId}")
-def delete_recommendation(recId: str):
-    raise HTTPException(status_code=501, detail="NOT IMPLEMENTED")
-
-
-@app.get("/health")
-def health_check():
-    return {"status": "OK"}
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

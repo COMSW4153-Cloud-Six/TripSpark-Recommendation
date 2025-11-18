@@ -1,0 +1,23 @@
+[
+    {
+      "name": "Central Perk Cafe",
+      "tags": ["coffee", "cozy", "breakfast"],
+      "budget": "medium"
+    },
+    {
+      "name": "Metropolitan Museum of Art",
+      "tags": ["museums", "art", "history"],
+      "budget": "high"
+    },
+    {
+      "name": "Brooklyn Bridge Park",
+      "tags": ["outdoors", "walks", "views"],
+      "budget": "low"
+    },
+    {
+      "name": "Chelsea Market",
+      "tags": ["food", "shopping", "coffee"],
+      "budget": "medium"
+    }
+  ] 
+  
