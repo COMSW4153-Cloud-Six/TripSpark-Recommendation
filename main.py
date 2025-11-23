@@ -7,6 +7,9 @@ import threading
 import requests
 import time
 from datetime import datetime
+from dotenv import load_dotenv
+import os
+load_dotenv()
 
 app = FastAPI(
     title="TripSpark Recommendation Service",
@@ -22,9 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_SERVICE_URL = "http://localhost:8081"
-CATALOG_SERVICE_URL = "http://localhost:8082"
-
+USER_SERVICE_URL = os.getenv("USER_URL", "http://localhost:8081")
+CATALOG_SERVICE_URL = os.getenv("CATALOG_URL", "http://localhost:8082")
 tasks = {}
 
 # ------------------------------
