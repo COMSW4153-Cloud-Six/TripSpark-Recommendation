@@ -1,305 +1,370 @@
-"""
-FastAPI travel recommendation backend using OpenAI for generation
-Supports:
- - POST /recommend -> returns an LLM-generated full-day itinerary
- - GET  /session/{user_id}/history -> view conversation memory
- - POST /session/{user_id}/clear -> clear memory for a user
-
-Memory: in-memory dict by default (ephemeral). To persist across restarts, set REDIS_URL environment variable.
-Environment:
- - OPENAI_API_KEY (required)
- - REDIS_URL (optional; e.g., redis://localhost:6379/0)
-"""
-
-import os
-import uuid
-import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Body
-from pydantic import BaseModel, Field
-from openai import OpenAI
-import httpx
+import uuid
+import threading
+import requests
+import time
+import asyncio
+import aiohttp
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import json
 
-# Optional Redis — used only if REDIS_URL provided
-try:
-    import redis.asyncio as redis_async
-except Exception:
-    redis_async = None
+app = FastAPI(
+    title="TripSpark Recommendation Service",
+    description="Composite microservice that generates travel recommendations by aggregating data from User and Catalog services",
+    version="1.0"
+)
 
-# -----------------------
-# Config
-# -----------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Please set the OPENAI_API_KEY environment variable.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-REDIS_URL = os.getenv("REDIS_URL")  # optional: e.g. redis://localhost:6379/0
-USE_REDIS = bool(REDIS_URL) and (redis_async is not None)
+USER_SERVICE_URL = "http://localhost:8081"  
+CATALOG_SERVICE_URL = "http://localhost:8082"  
 
-# LLM settings
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")  # change if needed
-MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "700"))
-TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.8"))
+tasks = {}
 
-# -----------------------
-# Initialize OpenAI client
-# -----------------------
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# -----------------------
-# Memory backend
-# -----------------------
-if USE_REDIS:
-    redis = redis_async.from_url(REDIS_URL)
-else:
-    # simple in-memory dict: user_id -> list of messages
-    _memory_store: Dict[str, List[Dict[str,str]]] = {}
-
-# helper funcs for memory
-async def get_memory(user_id: str) -> List[Dict[str, str]]:
-    if USE_REDIS:
-        raw = await redis.get(f"conversation:{user_id}")
-        if not raw:
-            return []
-        import json
-        return json.loads(raw)
-    else:
-        return _memory_store.get(user_id, [])
-
-async def append_memory(user_id: str, role: str, content: str):
-    if USE_REDIS:
-        import json
-        mem = await get_memory(user_id)
-        mem.append({"role": role, "content": content})
-        await redis.set(f"conversation:{user_id}", json.dumps(mem))
-    else:
-        if user_id not in _memory_store:
-            _memory_store[user_id] = []
-        _memory_store[user_id].append({"role": role, "content": content})
-
-async def clear_memory(user_id: str):
-    if USE_REDIS:
-        await redis.delete(f"conversation:{user_id}")
-    else:
-        _memory_store.pop(user_id, None)
-
-# -----------------------
-# API models
-# -----------------------
-class RecommendRequest(BaseModel):
-    user_id: Optional[str] = Field(None, description="Optional user id. If not provided, server will create one.")
-    city: str
-    season: str
-    min_budget: int
-    max_budget: int
-    preference: Optional[str] = None  # e.g., "food", "romantic", "adventure"
-    days: Optional[int] = Field(1, ge=1, le=14, description="Number of days for itinerary")
-
-class ItineraryItem(BaseModel):
-    time_of_day: str
-    description: str
-    estimated_price: Optional[str] = None
-
-class RecommendResponse(BaseModel):
+class RecommendationRequest(BaseModel):
     user_id: str
-    city: str
-    season: str
-    preference: Optional[str]
-    days: int
-    itinerary: Dict[str, List[ItineraryItem]]  # day -> list of items
+    destination: Optional[str] = None
+    vibes: List[str] = []
+    budget: Optional[str] = None
+    days: Optional[int] = 1
 
-# -----------------------
-# FastAPI app
-# -----------------------
-app = FastAPI(title="LLM Travel Recommender", version="1.0")
+class RecommendationResponse(BaseModel):
+    recommendation_id: str
+    user_id: str
+    destination: str
+    generated_at: datetime
+    recommendations: List[Dict[str, Any]]
+    user_preferences: Dict[str, Any]
+    catalog_data: Dict[str, Any]
+    _links: Dict[str, str]
 
-# -----------------------
-# Helpers to craft LLM prompt/messages
-# -----------------------
-def build_system_prompt() -> str:
-    return (
-        "You are an expert travel planner. Given a user's city, season, budget and preference tags, "
-        "generate a friendly, realistic, and varied day-by-day itinerary. "
-        "Each day should have: Morning, Lunch, Afternoon, Dinner, Evening suggestions. "
-        "Include one-sentence descriptions and an approximate price for each item. "
-        "Keep results concise and JSON-serializable. Do not ask clarifying questions. "
-        "If the user's budget is tight, bias towards low-cost options; if high, include premium options. "
-        "Prefer local experiences and include timing hints when appropriate."
-    )
+class AsyncTaskResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+    _links: Dict[str, str]
 
-def build_user_prompt(payload: RecommendRequest) -> str:
-    pref_text = f"Preference: {payload.preference}." if payload.preference else "No special preference."
-    budget_text = f"Budget per-person range: ${payload.min_budget} - ${payload.max_budget}."
-    return (
-        f"Plan {payload.days} day(s) of activities for a visitor to {payload.city} in {payload.season}. "
-        f"{pref_text} {budget_text} "
-        "Return a JSON object with keys 'day_1', 'day_2', ... each containing a list of 5 items "
-        "with 'time_of_day' (Morning/Lunch/Afternoon/Dinner/Evening), 'description', and 'estimated_price'. "
-        "Make the descriptions vivid and realistic. Keep prices approximate and within the budget range."
-    )
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    progress: Optional[float] = None
 
-# Utility to ask the OpenAI Chat API (uses the OpenAI Python client)
-async def call_llm(messages: List[Dict[str,str]]) -> str:
-    """
-    Calls OpenAI using the chat completions endpoint via the OpenAI Python client.
-    Returns the assistant text content (string).
-    """
-    # We wrap in async HTTP call; OpenAI client supports sync and may support async depending on version.
-    # Use the client's chat completion method if available, otherwise fall back to httpx.
-    try:
-        # Preferred: client.chat.completions.create(...)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE
-        )
-        # resp.choices[0].message.content or resp.choices[0].message['content'] depending on client
-        content = None
-        if hasattr(resp, "choices") and len(resp.choices) > 0:
-            # many SDK responses expose content differently depending on version:
-            choice0 = resp.choices[0]
-            if hasattr(choice0, "message") and choice0.message is not None:
-                content = choice0.message.get("content") if isinstance(choice0.message, dict) else choice0.message.content
-            else:
-                # older formats:
-                content = getattr(choice0, "text", None)
-        if content is None:
-            # fallback: str(resp)
-            content = str(resp)
-        return content
-    except Exception as e:
-        # fallback: call REST via httpx (transparent; requires OPENAI_API_KEY)
-        openai_url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=60.0) as http:
-            r = await http.post(openai_url, json={
-                "model": LLM_MODEL,
-                "messages": messages,
-                "max_tokens": MAX_TOKENS,
-                "temperature": TEMPERATURE
-            }, headers=headers)
-            r.raise_for_status()
-            j = r.json()
-            # try to extract content
-            try:
-                return j["choices"][0]["message"]["content"]
-            except Exception:
-                return j
-
-# Minimal JSON extractor (attempt to parse JSON out of free text)
-import json, re
-def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    """
-    If the LLM returns JSON, extract it. If it returns text with JSON inside, try to find the JSON substring.
-    Returns dict or None.
-    """
-    # Try direct parse
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    # Try to detect the first { ... } block
-    m = re.search(r"(\{(?:.|\n)*\})", text)
-    if m:
-        candidate = m.group(1)
+class UserServiceClient:
+    @staticmethod
+    def get_user(user_id: str) -> Dict[str, Any]:
+        """Get user data from User microservice"""
         try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    # Could not parse JSON
-    return None
-
-# -----------------------
-# Endpoints
-# -----------------------
-@app.post("/recommend", response_model=RecommendResponse)
-async def recommend(payload: RecommendRequest = Body(...)):
-    # assign or create user_id
-    user_id = payload.user_id or str(uuid.uuid4())
-
-    # Append user's request to memory
-    user_message_text = f"User requests itinerary: city={payload.city}, season={payload.season}, " \
-                        f"budget={payload.min_budget}-{payload.max_budget}, preference={payload.preference}, days={payload.days}"
-    await append_memory(user_id, "user", user_message_text)
-
-    # Build messages for LLM: include system, conversation memory, then user instruction
-    messages = [{"role": "system", "content": build_system_prompt()}]
-
-    # Retrieve short conversation history (we'll include up to last N messages to keep prompt size reasonable)
-    history = await get_memory(user_id)
-    # limit to last 12 messages to avoid very large contexts
-    recent = history[-12:] if len(history) > 12 else history
-    for m in recent:
-        messages.append({"role": m["role"], "content": m["content"]})
-
-    # Add user instruction
-    user_prompt = build_user_prompt(payload)
-    messages.append({"role": "user", "content": user_prompt})
-
-    # Call the LLM
-    llm_response_text = await call_llm(messages)
-
-    # Save assistant response to memory
-    await append_memory(user_id, "assistant", llm_response_text)
-
-    # Try to parse JSON
-    parsed = extract_json_from_text(llm_response_text)
-
-    itinerary_struct: Dict[str, List[ItineraryItem]] = {}
-
-    if parsed:
-        # Expect keys 'day_1', 'day_2', ...
-        for day_key, items in parsed.items():
-            # normalize each item into ItineraryItem
-            day_list = []
-            if isinstance(items, list):
-                for itm in items:
-                    # expected: time_of_day, description, estimated_price
-                    tod = itm.get("time_of_day") or itm.get("time") or "Unknown"
-                    desc = itm.get("description") or itm.get("desc") or str(itm)
-                    price = itm.get("estimated_price") or itm.get("price") or None
-                    day_list.append(ItineraryItem(time_of_day=tod, description=desc, estimated_price=price))
-            itinerary_struct[day_key] = day_list
-    else:
-        # If not JSON-parsable, create a fallback by splitting response into lines and placing into one day
-        lines = [ln.strip() for ln in llm_response_text.splitlines() if ln.strip()]
-        day_list = []
-        for i, ln in enumerate(lines[:20]):
-            # crude split: "Morning:" etc
-            if ":" in ln:
-                tod, rest = ln.split(":", 1)
-                day_list.append(ItineraryItem(time_of_day=tod.strip(), description=rest.strip(), estimated_price=None))
+            response = requests.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=5)
+            if response.status_code == 200:
+                return response.json()
             else:
-                day_list.append(ItineraryItem(time_of_day=f"item_{i+1}", description=ln, estimated_price=None))
-        itinerary_struct["day_1"] = day_list
+                raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=503, detail=f"User service unavailable: {str(e)}")
 
-    # Build result model
-    response = RecommendResponse(
+    @staticmethod
+    def get_user_preferences(user_id: str) -> Dict[str, Any]:
+        """Get user preferences from User microservice"""
+        try:
+            response = requests.get(f"{USER_SERVICE_URL}/users/{user_id}/preferences", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {}  
+        except requests.exceptions.RequestException:
+            return {}  
+
+class CatalogServiceClient:
+    @staticmethod
+    def get_pois(city: Optional[str] = None, tags: List[str] = None, budget: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get POIs from Catalog microservice"""
+        try:
+            params = {}
+            if city:
+                params['city'] = city
+            if tags:
+                params['tags'] = ','.join(tags)
+            if budget:
+                params['budget'] = budget
+                
+            response = requests.get(f"{CATALOG_SERVICE_URL}/pois", params=params, timeout=5)
+            if response.status_code == 200:
+                return response.json().get('pois', [])
+            else:
+                return []
+        except requests.exceptions.RequestException:
+            return []  
+
+    @staticmethod
+    def get_city_info(city: str) -> Optional[Dict[str, Any]]:
+        """Get city information from Catalog microservice"""
+        try:
+            response = requests.get(f"{CATALOG_SERVICE_URL}/cities/{city}", timeout=5)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except requests.exceptions.RequestException:
+            return None
+
+class RecommendationEngine:
+    def __init__(self):
+        self.user_client = UserServiceClient()
+        self.catalog_client = CatalogServiceClient()
+
+    def generate_recommendations(self, user_id: str, destination: Optional[str] = None, 
+                               vibes: List[str] = None, budget: Optional[str] = None) -> Dict[str, Any]:
+        """Generate recommendations using threaded parallel execution"""
+        vibes = vibes or []
+        
+        results = {}
+        errors = {}
+
+        def fetch_user_data():
+            try:
+                results['user'] = self.user_client.get_user(user_id)
+                results['preferences'] = self.user_client.get_user_preferences(user_id)
+            except Exception as e:
+                errors['user'] = str(e)
+
+        def fetch_catalog_data():
+            try:
+                results['pois'] = self.catalog_client.get_pois(city=destination, tags=vibes, budget=budget)
+                if destination:
+                    results['city_info'] = self.catalog_client.get_city_info(destination)
+            except Exception as e:
+                errors['catalog'] = str(e)
+
+        user_thread = threading.Thread(target=fetch_user_data)
+        catalog_thread = threading.Thread(target=fetch_catalog_data)
+        
+        user_thread.start()
+        catalog_thread.start()
+        
+        user_thread.join()
+        catalog_thread.join()
+
+        if errors:
+            raise HTTPException(status_code=500, detail=f"Service errors: {errors}")
+
+        recommendations = self._compute_recommendations(results, vibes, budget)
+        
+        return {
+            'user_data': results.get('user', {}),
+            'user_preferences': results.get('preferences', {}),
+            'catalog_data': {
+                'pois': results.get('pois', []),
+                'city_info': results.get('city_info', {})
+            },
+            'recommendations': recommendations
+        }
+
+    def _compute_recommendations(self, data: Dict[str, Any], vibes: List[str], budget: str) -> List[Dict[str, Any]]:
+        """Compute personalized recommendations based on user preferences and catalog data"""
+        user_prefs = data.get('user_preferences', {})
+        pois = data.get('pois', [])
+        
+        recommendations = []
+        
+        for poi in pois[:10]:  # here, we will limit at top 10
+            score = 0
+            
+            poi_tags = poi.get('tags', [])
+            matching_tags = set(poi_tags) & set(vibes)
+            score += len(matching_tags) * 2
+            
+            if budget and poi.get('budget') == budget:
+                score += 3
+                
+            user_interests = user_prefs.get('interests', [])
+            matching_interests = set(poi_tags) & set(user_interests)
+            score += len(matching_interests)
+            
+            score += poi.get('rating', 0) / 5 * 2
+            
+            if score > 0:
+                recommendations.append({
+                    'poi_id': poi.get('id'),
+                    'name': poi.get('name'),
+                    'type': poi.get('type', 'attraction'),
+                    'description': poi.get('description'),
+                    'location': poi.get('location'),
+                    'budget': poi.get('budget'),
+                    'rating': poi.get('rating'),
+                    'score': score,
+                    'matching_tags': list(matching_tags),
+                    'reason': f"Matches {len(matching_tags)} of your preferences"
+                })
+        
+        recommendations.sort(key=lambda x: x['score'], reverse=True)
+        return recommendations[:5]
+
+def generate_recommendations_async(task_id: str, user_id: str, destination: str, vibes: List[str], budget: str):
+    """Background task for async recommendation generation"""
+    try:
+        tasks[task_id] = {"status": "processing", "progress": 0.1}
+        
+        engine = RecommendationEngine()
+        
+        time.sleep(2)
+        tasks[task_id]["progress"] = 0.5
+        
+        result = engine.generate_recommendations(user_id, destination, vibes, budget)
+        
+        tasks[task_id] = {
+            "status": "completed", 
+            "progress": 1.0,
+            "result": result,
+            "completed_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        tasks[task_id] = {
+            "status": "failed",
+            "error": str(e),
+            "failed_at": datetime.now().isoformat()
+        }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    services_health = {}
+    try:
+        user_health = requests.get(f"{USER_SERVICE_URL}/health", timeout=2)
+        services_health['user_service'] = user_health.status_code == 200
+    except:
+        services_health['user_service'] = False
+        
+    try:
+        catalog_health = requests.get(f"{CATALOG_SERVICE_URL}/health", timeout=2)
+        services_health['catalog_service'] = catalog_health.status_code == 200
+    except:
+        services_health['catalog_service'] = False
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(),
+        "services": services_health,
+        "service": "recommendation_composite"
+    }
+
+@app.get("/recommendations/{user_id}", response_model=RecommendationResponse)
+async def get_recommendations(user_id: str, destination: Optional[str] = None, 
+                            vibes: str = "", budget: Optional[str] = None):
+    """
+    Get real-time recommendations using parallel threaded execution
+    - Calls User service and Catalog service concurrently using threads
+    - Combines data to generate personalized recommendations
+    """
+    vibes_list = [vibe.strip() for vibe in vibes.split(",")] if vibes else []
+    
+    engine = RecommendationEngine()
+    result = engine.generate_recommendations(user_id, destination, vibes_list, budget)
+    
+    recommendation_id = str(uuid.uuid4())
+    
+    return RecommendationResponse(
+        recommendation_id=recommendation_id,
         user_id=user_id,
-        city=payload.city,
-        season=payload.season,
-        preference=payload.preference,
-        days=payload.days,
-        itinerary=itinerary_struct
+        destination=destination or "general",
+        generated_at=datetime.now(),
+        recommendations=result['recommendations'],
+        user_preferences=result['user_preferences'],
+        catalog_data=result['catalog_data'],
+        _links={
+            "self": f"/recommendations/{user_id}",
+            "user": f"/users/{user_id}",
+            "catalog": "/catalog",
+            "async": f"/recommendations/async/{user_id}"
+        }
     )
-    return response
 
-@app.get("/session/{user_id}/history")
-async def session_history(user_id: str):
-    mem = await get_memory(user_id)
-    return {"user_id": user_id, "history": mem}
+@app.post("/recommendations/async/{user_id}", status_code=status.HTTP_202_ACCEPTED, response_model=AsyncTaskResponse)
+async def start_async_recommendations(
+    user_id: str, 
+    background_tasks: BackgroundTasks,
+    destination: Optional[str] = None,
+    vibes: str = "",
+    budget: Optional[str] = None
+):
+    """
+    Start async recommendation generation (202 Accepted pattern)
+    - Returns immediately with task ID
+    - Client polls for status using the task ID
+    """
+    try:
+        user_client = UserServiceClient()
+        user_client.get_user(user_id)  
+    except HTTPException:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    
+    task_id = str(uuid.uuid4())
+    vibes_list = [vibe.strip() for vibe in vibes.split(",")] if vibes else []
+    
+    background_tasks.add_task(
+        generate_recommendations_async, 
+        task_id, user_id, destination or "general", vibes_list, budget
+    )
+    
+    tasks[task_id] = {"status": "accepted", "progress": 0.0}
+    
+    return AsyncTaskResponse(
+        task_id=task_id,
+        status="accepted",
+        message="Recommendation generation started",
+        _links={
+            "status": f"/recommendations/status/{task_id}",
+            "user": f"/users/{user_id}",
+            "self": f"/recommendations/async/{user_id}"
+        }
+    )
 
-@app.post("/session/{user_id}/clear")
-async def session_clear(user_id: str):
-    await clear_memory(user_id)
-    return {"user_id": user_id, "status": "cleared"}
+@app.get("/recommendations/status/{task_id}", response_model=TaskStatusResponse)
+async def get_async_task_status(task_id: str):
+    """
+    Poll async task status
+    - Client polls this endpoint to check recommendation generation progress
+    """
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=task["status"],
+        result=task.get("result"),
+        progress=task.get("progress", 0.0)
+    )
 
-# Root health check
 @app.get("/")
 async def root():
-    return {"ok": True, "info": "LLM Travel Recommender. POST /recommend to get itineraries."}
+    """Root endpoint with service information"""
+    return {
+        "message": "TripSpark Recommendation Composite Service",
+        "version": "1.0",
+        "description": "Aggregates data from User and Catalog services to generate personalized travel recommendations",
+        "endpoints": {
+            "health": "GET /health",
+            "realtime_recommendations": "GET /recommendations/{user_id}",
+            "async_recommendations": "POST /recommendations/async/{user_id}",
+            "async_status": "GET /recommendations/status/{task_id}"
+        },
+        "dependencies": {
+            "user_service": USER_SERVICE_URL,
+            "catalog_service": CATALOG_SERVICE_URL
+        }
+    }
 
-# Run with: uvicorn main:app --reload
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
