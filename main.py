@@ -6,16 +6,12 @@ import uuid
 import threading
 import requests
 import time
-import asyncio
-import aiohttp
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-import json
 
 app = FastAPI(
     title="TripSpark Recommendation Service",
-    description="Composite microservice that generates travel recommendations by aggregating data from User and Catalog services",
-    version="1.0"
+    description="Composite microservice aggregating User + Catalog services",
+    version="2.0"
 )
 
 app.add_middleware(
@@ -26,17 +22,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_SERVICE_URL = "http://localhost:8081"  
-CATALOG_SERVICE_URL = "http://localhost:8082"  
+USER_SERVICE_URL = "http://localhost:8081"
+CATALOG_SERVICE_URL = "http://localhost:8082"
 
 tasks = {}
 
-class RecommendationRequest(BaseModel):
-    user_id: str
-    destination: Optional[str] = None
-    vibes: List[str] = []
-    budget: Optional[str] = None
-    days: Optional[int] = 1
+# ------------------------------
+# RESPONSE MODELS
+# ------------------------------
 
 class RecommendationResponse(BaseModel):
     recommendation_id: str
@@ -44,7 +37,7 @@ class RecommendationResponse(BaseModel):
     destination: str
     generated_at: datetime
     recommendations: List[Dict[str, Any]]
-    user_preferences: Dict[str, Any]
+    user_profile: Dict[str, Any]
     catalog_data: Dict[str, Any]
     _links: Dict[str, str]
 
@@ -60,310 +53,300 @@ class TaskStatusResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
     progress: Optional[float] = None
 
+
+# ------------------------------
+# USER SERVICE CLIENT
+# ------------------------------
+
 class UserServiceClient:
-    @staticmethod
-    def get_user(user_id: str) -> Dict[str, Any]:
-        """Get user data from User microservice"""
-        try:
-            response = requests.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=5)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                raise HTTPException(status_code=404, detail=f"User {user_id} not found")
-        except requests.exceptions.RequestException as e:
-            raise HTTPException(status_code=503, detail=f"User service unavailable: {str(e)}")
 
     @staticmethod
-    def get_user_preferences(user_id: str) -> Dict[str, Any]:
-        """Get user preferences from User microservice"""
+    def get_user(user_id: str):
         try:
-            response = requests.get(f"{USER_SERVICE_URL}/users/{user_id}/preferences", timeout=5)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {}  
-        except requests.exceptions.RequestException:
-            return {}  
+            res = requests.get(f"{USER_SERVICE_URL}/users/{user_id}", timeout=5)
+            if res.status_code == 200:
+                return res.json()
+            raise HTTPException(status_code=404, detail="User not found")
+        except Exception:
+            raise HTTPException(status_code=503, detail="User service unavailable")
+
+    @staticmethod
+    def get_profile(user_id: str):
+        try:
+            res = requests.get(f"{USER_SERVICE_URL}/users/{user_id}/profile", timeout=5)
+            if res.status_code == 200:
+                return res.json()
+            raise HTTPException(status_code=404, detail="Profile not found")
+        except Exception:
+            raise HTTPException(status_code=503, detail="User service unavailable")
+
+
+# ------------------------------
+# CATALOG SERVICE CLIENT
+# ------------------------------
 
 class CatalogServiceClient:
-    @staticmethod
-    def get_pois(city: Optional[str] = None, tags: List[str] = None, budget: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get POIs from Catalog microservice"""
-        try:
-            params = {}
-            if city:
-                params['city'] = city
-            if tags:
-                params['tags'] = ','.join(tags)
-            if budget:
-                params['budget'] = budget
-                
-            response = requests.get(f"{CATALOG_SERVICE_URL}/pois", params=params, timeout=5)
-            if response.status_code == 200:
-                return response.json().get('pois', [])
-            else:
-                return []
-        except requests.exceptions.RequestException:
-            return []  
 
     @staticmethod
-    def get_city_info(city: str) -> Optional[Dict[str, Any]]:
-        """Get city information from Catalog microservice"""
+    def get_pois(city: Optional[str] = None, tags: List[str] = None, budget: Optional[str] = None):
+        params = {}
+        if city: params["city"] = city
+        if tags: params["tags"] = ",".join(tags)
+        if budget: params["budget"] = budget
+
         try:
-            response = requests.get(f"{CATALOG_SERVICE_URL}/cities/{city}", timeout=5)
-            if response.status_code == 200:
-                return response.json()
-            return None
-        except requests.exceptions.RequestException:
-            return None
+            res = requests.get(f"{CATALOG_SERVICE_URL}/pois", params=params, timeout=5)
+            if res.status_code == 200:
+                return res.json().get("pois", [])
+            return []
+        except:
+            return []
+
+
+# ------------------------------
+# RECOMMENDATION ENGINE
+# ------------------------------
 
 class RecommendationEngine:
     def __init__(self):
         self.user_client = UserServiceClient()
         self.catalog_client = CatalogServiceClient()
 
-    def generate_recommendations(self, user_id: str, destination: Optional[str] = None, 
-                               vibes: List[str] = None, budget: Optional[str] = None) -> Dict[str, Any]:
-        """Generate recommendations using threaded parallel execution"""
-        vibes = vibes or []
-        
+    def generate_recommendations(self, user_id, destination, vibes, budget):
+
         results = {}
         errors = {}
 
-        def fetch_user_data():
+        # ----- THREAD 1: USER -----
+        def fetch_user():
             try:
-                results['user'] = self.user_client.get_user(user_id)
-                results['preferences'] = self.user_client.get_user_preferences(user_id)
+                user = self.user_client.get_user(user_id)
+                profile = self.user_client.get_profile(user_id)
+                results["profile"] = profile
             except Exception as e:
-                errors['user'] = str(e)
+                errors["user"] = str(e)
 
-        def fetch_catalog_data():
+        # ----- THREAD 2: CATALOG -----
+        def fetch_catalog():
             try:
-                results['pois'] = self.catalog_client.get_pois(city=destination, tags=vibes, budget=budget)
-                if destination:
-                    results['city_info'] = self.catalog_client.get_city_info(destination)
+                pois = self.catalog_client.get_pois(
+                    city=destination,
+                    tags=vibes,
+                    budget=budget
+                )
+                results["pois"] = pois
             except Exception as e:
-                errors['catalog'] = str(e)
+                errors["catalog"] = str(e)
 
-        user_thread = threading.Thread(target=fetch_user_data)
-        catalog_thread = threading.Thread(target=fetch_catalog_data)
-        
-        user_thread.start()
-        catalog_thread.start()
-        
-        user_thread.join()
-        catalog_thread.join()
+        t1 = threading.Thread(target=fetch_user)
+        t2 = threading.Thread(target=fetch_catalog)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
 
         if errors:
-            raise HTTPException(status_code=500, detail=f"Service errors: {errors}")
+            raise HTTPException(status_code=500, detail=errors)
 
-        recommendations = self._compute_recommendations(results, vibes, budget)
-        
+        recs = self._compute_recommendations(results, vibes, budget)
+
         return {
-            'user_data': results.get('user', {}),
-            'user_preferences': results.get('preferences', {}),
-            'catalog_data': {
-                'pois': results.get('pois', []),
-                'city_info': results.get('city_info', {})
-            },
-            'recommendations': recommendations
+            "user_profile": results["profile"],
+            "catalog_data": {"pois": results["pois"]},
+            "recommendations": recs
         }
 
-    def _compute_recommendations(self, data: Dict[str, Any], vibes: List[str], budget: str) -> List[Dict[str, Any]]:
-        """Compute personalized recommendations based on user preferences and catalog data"""
-        user_prefs = data.get('user_preferences', {})
-        pois = data.get('pois', [])
-        
+
+    # -------------------------------------------
+    # MATCHING + SCORING (Aligned with Catalog + UserProfile)
+    # -------------------------------------------
+
+    def _compute_recommendations(self, data, vibes, budget):
+        profile = data["user_profile"]
+        pois = data["catalog_data"]["pois"]
+
+        # Convert UserProfile fields into tag sets
+        user_vibes = set(profile.get("preferred_vibes", []))
+        user_food = set(profile.get("favorite_foods", []))
+        user_activities = set(profile.get("favorite_activities", []))
+
+        user_tags = user_vibes | user_food | user_activities
+
+        # Combine passed-in vibes with user vibes
+        request_vibes = set([v.strip() for v in vibes]) if vibes else set()
+        effective_vibes = user_vibes | request_vibes
+
+        user_budget_pref = profile.get("spending_preference")
+        user_daily_budget = profile.get("daily_budget_limit")
+
         recommendations = []
-        
-        for poi in pois[:10]:  # here, we will limit at top 10
+
+        for poi in pois[:50]:
+
             score = 0
-            
-            poi_tags = poi.get('tags', [])
-            matching_tags = set(poi_tags) & set(vibes)
+
+            # ---- Extract POI tags ----
+            poi_vibes = set([v.strip() for v in poi.get("vibes", "").split(",") if v.strip()])
+            poi_activities = set([a.strip() for a in poi.get("activities", "").split(",") if a.strip()])
+            poi_food = set([f.strip() for f in poi.get("food", "").split(",") if f.strip()])
+
+            poi_tags = poi_vibes | poi_activities | poi_food
+
+            # ---- Match tags ----
+            matching_tags = poi_tags & user_tags
             score += len(matching_tags) * 2
-            
-            if budget and poi.get('budget') == budget:
+
+            # ---- Match vibes ----
+            matching_vibes = poi_vibes & effective_vibes
+            score += len(matching_vibes) * 1
+
+            # ---- Spending preference match ----
+            if user_budget_pref and poi.get("spending") == user_budget_pref:
                 score += 3
-                
-            user_interests = user_prefs.get('interests', [])
-            matching_interests = set(poi_tags) & set(user_interests)
-            score += len(matching_interests)
-            
-            score += poi.get('rating', 0) / 5 * 2
-            
+
+            # ---- Numeric budget match ----
+            if user_daily_budget and poi.get("budget"):
+                if poi["budget"] <= user_daily_budget:
+                    score += 2
+
+            # ---- Rating boost ----
+            score += (poi.get("rating", 0) / 5) * 2
+
             if score > 0:
                 recommendations.append({
-                    'poi_id': poi.get('id'),
-                    'name': poi.get('name'),
-                    'type': poi.get('type', 'attraction'),
-                    'description': poi.get('description'),
-                    'location': poi.get('location'),
-                    'budget': poi.get('budget'),
-                    'rating': poi.get('rating'),
-                    'score': score,
-                    'matching_tags': list(matching_tags),
-                    'reason': f"Matches {len(matching_tags)} of your preferences"
+                    "poi_id": poi.get("poi"),   # unique identifier
+                    "name": poi.get("poi"),
+                    "city": poi.get("city"),
+                    "country": poi.get("country"),
+                    "location": {
+                        "latitude": poi.get("latitude"),
+                        "longitude": poi.get("longitude"),
+                    },
+                    "spending": poi.get("spending"),
+                    "budget": poi.get("budget"),
+                    "rating": poi.get("rating"),
+                    "score": score,
+                    "matching_tags": list(matching_tags),
+                    "matching_vibes": list(matching_vibes),
                 })
-        
-        recommendations.sort(key=lambda x: x['score'], reverse=True)
+
+        recommendations.sort(key=lambda x: x["score"], reverse=True)
         return recommendations[:5]
 
-def generate_recommendations_async(task_id: str, user_id: str, destination: str, vibes: List[str], budget: str):
-    """Background task for async recommendation generation"""
+
+# ------------------------------
+# ASYNC BACKGROUND TASK
+# ------------------------------
+
+def generate_async_task(task_id, user_id, destination, vibes, budget):
     try:
         tasks[task_id] = {"status": "processing", "progress": 0.1}
-        
+        time.sleep(1)
+
         engine = RecommendationEngine()
-        
-        time.sleep(2)
-        tasks[task_id]["progress"] = 0.5
-        
         result = engine.generate_recommendations(user_id, destination, vibes, budget)
-        
+
         tasks[task_id] = {
-            "status": "completed", 
+            "status": "completed",
             "progress": 1.0,
             "result": result,
             "completed_at": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
-        tasks[task_id] = {
-            "status": "failed",
-            "error": str(e),
-            "failed_at": datetime.now().isoformat()
-        }
+        tasks[task_id] = {"status": "failed", "error": str(e)}
+
+
+# ------------------------------
+# ENDPOINTS
+# ------------------------------
 
 @app.get("/health")
-async def health():
-    """Health check endpoint"""
-    services_health = {}
-    try:
-        user_health = requests.get(f"{USER_SERVICE_URL}/health", timeout=2)
-        services_health['user_service'] = user_health.status_code == 200
-    except:
-        services_health['user_service'] = False
-        
-    try:
-        catalog_health = requests.get(f"{CATALOG_SERVICE_URL}/health", timeout=2)
-        services_health['catalog_service'] = catalog_health.status_code == 200
-    except:
-        services_health['catalog_service'] = False
-    
+def health():
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(),
-        "services": services_health,
-        "service": "recommendation_composite"
+        "status": "ok",
+        "timestamp": datetime.utcnow(),
+        "services": {
+            "user": requests.get(f"{USER_SERVICE_URL}/health").status_code == 200,
+            "catalog": requests.get(f"{CATALOG_SERVICE_URL}/health").status_code == 200,
+        }
     }
 
+
 @app.get("/recommendations/{user_id}", response_model=RecommendationResponse)
-async def get_recommendations(user_id: str, destination: Optional[str] = None, 
-                            vibes: str = "", budget: Optional[str] = None):
-    """
-    Get real-time recommendations using parallel threaded execution
-    - Calls User service and Catalog service concurrently using threads
-    - Combines data to generate personalized recommendations
-    """
-    vibes_list = [vibe.strip() for vibe in vibes.split(",")] if vibes else []
-    
+def get_recommendations(
+    user_id: str,
+    destination: Optional[str] = None,
+    vibes: str = "",
+    budget: Optional[str] = None
+):
+
+    vibes_list = [v.strip() for v in vibes.split(",")] if vibes else []
+
     engine = RecommendationEngine()
     result = engine.generate_recommendations(user_id, destination, vibes_list, budget)
-    
-    recommendation_id = str(uuid.uuid4())
-    
+
+    rec_id = str(uuid.uuid4())
+
     return RecommendationResponse(
-        recommendation_id=recommendation_id,
+        recommendation_id=rec_id,
         user_id=user_id,
         destination=destination or "general",
         generated_at=datetime.now(),
-        recommendations=result['recommendations'],
-        user_preferences=result['user_preferences'],
-        catalog_data=result['catalog_data'],
+        recommendations=result["recommendations"],
+        user_profile=result["user_profile"],
+        catalog_data=result["catalog_data"],
         _links={
             "self": f"/recommendations/{user_id}",
             "user": f"/users/{user_id}",
-            "catalog": "/catalog",
             "async": f"/recommendations/async/{user_id}"
         }
     )
 
-@app.post("/recommendations/async/{user_id}", status_code=status.HTTP_202_ACCEPTED, response_model=AsyncTaskResponse)
-async def start_async_recommendations(
-    user_id: str, 
+
+@app.post("/recommendations/async/{user_id}", status_code=202, response_model=AsyncTaskResponse)
+def start_async(
+    user_id: str,
     background_tasks: BackgroundTasks,
     destination: Optional[str] = None,
     vibes: str = "",
     budget: Optional[str] = None
 ):
-    """
-    Start async recommendation generation (202 Accepted pattern)
-    - Returns immediately with task ID
-    - Client polls for status using the task ID
-    """
-    try:
-        user_client = UserServiceClient()
-        user_client.get_user(user_id)  
-    except HTTPException:
-        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
-    
+
+    # Validate user exists
+    UserServiceClient().get_user(user_id)
+
     task_id = str(uuid.uuid4())
-    vibes_list = [vibe.strip() for vibe in vibes.split(",")] if vibes else []
-    
-    background_tasks.add_task(
-        generate_recommendations_async, 
-        task_id, user_id, destination or "general", vibes_list, budget
-    )
-    
+    vibes_list = [v.strip() for v in vibes.split(",")] if vibes else []
+
     tasks[task_id] = {"status": "accepted", "progress": 0.0}
-    
+
+    background_tasks.add_task(
+        generate_async_task,
+        task_id, user_id, destination, vibes_list, budget
+    )
+
     return AsyncTaskResponse(
         task_id=task_id,
         status="accepted",
-        message="Recommendation generation started",
-        _links={
-            "status": f"/recommendations/status/{task_id}",
-            "user": f"/users/{user_id}",
-            "self": f"/recommendations/async/{user_id}"
-        }
+        message="Task started.",
+        _links={"status": f"/recommendations/status/{task_id}"}
     )
+
 
 @app.get("/recommendations/status/{task_id}", response_model=TaskStatusResponse)
-async def get_async_task_status(task_id: str):
-    """
-    Poll async task status
-    - Client polls this endpoint to check recommendation generation progress
-    """
-    task = tasks.get(task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return TaskStatusResponse(
-        task_id=task_id,
-        status=task["status"],
-        result=task.get("result"),
-        progress=task.get("progress", 0.0)
-    )
+def task_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return TaskStatusResponse(task_id=task_id, **tasks[task_id])
+
 
 @app.get("/")
-async def root():
-    """Root endpoint with service information"""
-    return {
-        "message": "TripSpark Recommendation Composite Service",
-        "version": "1.0",
-        "description": "Aggregates data from User and Catalog services to generate personalized travel recommendations",
-        "endpoints": {
-            "health": "GET /health",
-            "realtime_recommendations": "GET /recommendations/{user_id}",
-            "async_recommendations": "POST /recommendations/async/{user_id}",
-            "async_status": "GET /recommendations/status/{task_id}"
-        },
-        "dependencies": {
-            "user_service": USER_SERVICE_URL,
-            "catalog_service": CATALOG_SERVICE_URL
-        }
-    }
+def root():
+    return {"message": "TripSpark Recommendation Composite Service v2.0"}
+
+
+# ------------------------------
+# LOCAL RUN
+# ------------------------------
 
 if __name__ == "__main__":
     import uvicorn
