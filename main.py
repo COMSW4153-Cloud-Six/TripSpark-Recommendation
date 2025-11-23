@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
 
 app = FastAPI(
@@ -29,9 +30,9 @@ USER_SERVICE_URL = os.getenv("USER_URL")
 CATALOG_SERVICE_URL = os.getenv("CATALOG_URL")
 tasks = {}
 
-# ------------------------------
+# ============================================
 # RESPONSE MODELS
-# ------------------------------
+# ============================================
 
 class RecommendationResponse(BaseModel):
     recommendation_id: str
@@ -55,10 +56,9 @@ class TaskStatusResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
     progress: Optional[float] = None
 
-
-# ------------------------------
-# USER SERVICE CLIENT
-# ------------------------------
+# ============================================
+# USER CLIENT
+# ============================================
 
 class UserServiceClient:
 
@@ -82,10 +82,9 @@ class UserServiceClient:
         except Exception:
             raise HTTPException(status_code=503, detail="User service unavailable")
 
-
-# ------------------------------
-# CATALOG SERVICE CLIENT
-# ------------------------------
+# ============================================
+# CATALOG CLIENT
+# ============================================
 
 class CatalogServiceClient:
 
@@ -104,12 +103,12 @@ class CatalogServiceClient:
         except:
             return []
 
-
-# ------------------------------
+# ============================================
 # RECOMMENDATION ENGINE
-# ------------------------------
+# ============================================
 
 class RecommendationEngine:
+
     def __init__(self):
         self.user_client = UserServiceClient()
         self.catalog_client = CatalogServiceClient()
@@ -119,7 +118,7 @@ class RecommendationEngine:
         results = {}
         errors = {}
 
-        # ----- THREAD 1: USER -----
+        # THREAD 1 — USER
         def fetch_user():
             try:
                 user = self.user_client.get_user(user_id)
@@ -128,7 +127,7 @@ class RecommendationEngine:
             except Exception as e:
                 errors["user"] = str(e)
 
-        # ----- THREAD 2: CATALOG -----
+        # THREAD 2 — CATALOG
         def fetch_catalog():
             try:
                 pois = self.catalog_client.get_pois(
@@ -156,23 +155,19 @@ class RecommendationEngine:
             "recommendations": recs
         }
 
-
     # -------------------------------------------
-    # MATCHING + SCORING (Aligned with Catalog + UserProfile)
+    # MATCHING + SCORING
     # -------------------------------------------
 
     def _compute_recommendations(self, data, vibes, budget):
         profile = data["user_profile"]
         pois = data["catalog_data"]["pois"]
 
-        # Convert UserProfile fields into tag sets
         user_vibes = set(profile.get("preferred_vibes", []))
         user_food = set(profile.get("favorite_foods", []))
         user_activities = set(profile.get("favorite_activities", []))
-
         user_tags = user_vibes | user_food | user_activities
 
-        # Combine passed-in vibes with user vibes
         request_vibes = set([v.strip() for v in vibes]) if vibes else set()
         effective_vibes = user_vibes | request_vibes
 
@@ -185,36 +180,29 @@ class RecommendationEngine:
 
             score = 0
 
-            # ---- Extract POI tags ----
             poi_vibes = set([v.strip() for v in poi.get("vibes", "").split(",") if v.strip()])
             poi_activities = set([a.strip() for a in poi.get("activities", "").split(",") if a.strip()])
             poi_food = set([f.strip() for f in poi.get("food", "").split(",") if f.strip()])
-
             poi_tags = poi_vibes | poi_activities | poi_food
 
-            # ---- Match tags ----
             matching_tags = poi_tags & user_tags
             score += len(matching_tags) * 2
 
-            # ---- Match vibes ----
             matching_vibes = poi_vibes & effective_vibes
-            score += len(matching_vibes) * 1
+            score += len(matching_vibes)
 
-            # ---- Spending preference match ----
             if user_budget_pref and poi.get("spending") == user_budget_pref:
                 score += 3
 
-            # ---- Numeric budget match ----
             if user_daily_budget and poi.get("budget"):
                 if poi["budget"] <= user_daily_budget:
                     score += 2
 
-            # ---- Rating boost ----
             score += (poi.get("rating", 0) / 5) * 2
 
             if score > 0:
                 recommendations.append({
-                    "poi_id": poi.get("poi"),   # unique identifier
+                    "poi_id": poi.get("poi"),
                     "name": poi.get("poi"),
                     "city": poi.get("city"),
                     "country": poi.get("country"),
@@ -233,10 +221,9 @@ class RecommendationEngine:
         recommendations.sort(key=lambda x: x["score"], reverse=True)
         return recommendations[:5]
 
-
-# ------------------------------
+# ============================================
 # ASYNC BACKGROUND TASK
-# ------------------------------
+# ============================================
 
 def generate_async_task(task_id, user_id, destination, vibes, budget):
     try:
@@ -256,10 +243,9 @@ def generate_async_task(task_id, user_id, destination, vibes, budget):
     except Exception as e:
         tasks[task_id] = {"status": "failed", "error": str(e)}
 
-
-# ------------------------------
+# ============================================
 # ENDPOINTS
-# ------------------------------
+# ============================================
 
 @app.get("/health")
 def health():
@@ -272,6 +258,9 @@ def health():
         }
     }
 
+# ==========================================================
+#  🔥 SYNC RECOMMENDATIONS — WITH FK VALIDATION
+# ==========================================================
 
 @app.get("/recommendations/{user_id}", response_model=RecommendationResponse)
 def get_recommendations(
@@ -280,9 +269,41 @@ def get_recommendations(
     vibes: str = "",
     budget: Optional[str] = None
 ):
+    # -------------------------------
+    # LOGICAL FOREIGN KEY CONSTRAINT
+    # -------------------------------
 
+    # 1. Validate user_id exists → FK check
+    try:
+        UserServiceClient().get_user(user_id)
+    except HTTPException as e:
+        if e.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Foreign key constraint failed: user_id '{user_id}' does not exist in User Service"
+            )
+        raise
+
+    # 2. Optional: validate that destination city exists in catalog
+    if destination:
+        try:
+            test_catalog = requests.get(
+                f"{CATALOG_SERVICE_URL}/pois",
+                params={"city": destination},
+                timeout=5
+            )
+            if test_catalog.status_code != 200:
+                raise Exception()
+        except:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Foreign key constraint failed: destination '{destination}' is not recognized by Catalog Service"
+            )
+
+    # -------------------------------
+    # Continue with recommendation logic
+    # -------------------------------
     vibes_list = [v.strip() for v in vibes.split(",")] if vibes else []
-
     engine = RecommendationEngine()
     result = engine.generate_recommendations(user_id, destination, vibes_list, budget)
 
@@ -303,6 +324,9 @@ def get_recommendations(
         }
     )
 
+# ==========================================================
+#  🔥 ASYNC RECOMMENDATIONS — FK VALIDATION
+# ==========================================================
 
 @app.post("/recommendations/async/{user_id}", status_code=202, response_model=AsyncTaskResponse)
 def start_async(
@@ -313,8 +337,18 @@ def start_async(
     budget: Optional[str] = None
 ):
 
-    # Validate user exists
-    UserServiceClient().get_user(user_id)
+    # -------------------------------
+    # LOGICAL FK CONSTRAINT (user_id)
+    # -------------------------------
+    try:
+        UserServiceClient().get_user(user_id)
+    except HTTPException as e:
+        if e.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Foreign key constraint failed: user_id '{user_id}' does not exist"
+            )
+        raise
 
     task_id = str(uuid.uuid4())
     vibes_list = [v.strip() for v in vibes.split(",")] if vibes else []
@@ -333,23 +367,21 @@ def start_async(
         _links={"status": f"/recommendations/status/{task_id}"}
     )
 
-
 @app.get("/recommendations/status/{task_id}", response_model=TaskStatusResponse)
 def task_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found.")
     return TaskStatusResponse(task_id=task_id, **tasks[task_id])
 
-
 @app.get("/")
 def root():
     return {"message": "TripSpark Recommendation Composite Service v2.0"}
 
-
-# ------------------------------
+# ============================================
 # LOCAL RUN
-# ------------------------------
+# ============================================
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
