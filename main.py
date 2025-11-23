@@ -25,8 +25,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-USER_SERVICE_URL = os.getenv("USER_URL", "http://localhost:8081")
-CATALOG_SERVICE_URL = os.getenv("CATALOG_URL", "http://localhost:8082")
+USER_SERVICE_URL = os.getenv("USER_URL")
+CATALOG_SERVICE_URL = os.getenv("CATALOG_URL")
 tasks = {}
 
 # ------------------------------
@@ -352,4 +352,4 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
