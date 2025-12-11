@@ -1,0 +1,15 @@
+{
+  "recommendation_id": "rec1",
+  "user_id": "123",
+  "destination": "new york",
+  "generated_at": "2025-01-01T00:00:00Z",
+  "recommendations": [
+    { "poi": "times square", "score": 0.95 },
+    { "poi": "central park", "score": 0.88 }
+  ],
+  "user_profile": {
+    "age": 25,
+    "vibes": ["nature", "sightseeing"]
+  },
+  "catalog_data": []
+}

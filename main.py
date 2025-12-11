@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
 
@@ -257,6 +258,22 @@ def health():
             "catalog": requests.get(f"{CATALOG_SERVICE_URL}/health").status_code == 200,
         }
     }
+
+# sample data
+@app.get("/recommendations/{user_name}")
+def get_sample_recommendation(
+    user_name: str,
+    destination: Optional[str] = None,
+    vibes: str = "",
+    budget: Optional[str] = None
+):
+    """Return recommendations."""
+    try:
+        with open("data/sample.json", "r") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        return {"error": str(e)}
 
 # ==========================================================
 #  🔥 SYNC RECOMMENDATIONS — WITH FK VALIDATION
