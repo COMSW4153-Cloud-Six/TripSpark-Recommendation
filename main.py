@@ -276,7 +276,7 @@ def get_recommendation(
 
 
 # ==========================================================
-#  🔥 SYNC RECOMMENDATIONS — WITH FK VALIDATION
+#  SYNC RECOMMENDATIONS — WITH FK VALIDATION
 # ==========================================================
 
 @app.get("/recommendations/{user_id}", response_model=RecommendationResponse)
@@ -342,7 +342,7 @@ def get_recommendations(
     )
 
 # ==========================================================
-#  🔥 ASYNC RECOMMENDATIONS — FK VALIDATION
+#  ASYNC RECOMMENDATIONS — FK VALIDATION
 # ==========================================================
 
 @app.post("/recommendations/async/{user_id}", status_code=202, response_model=AsyncTaskResponse)
