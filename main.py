@@ -259,21 +259,21 @@ def health():
         }
     }
 
-# sample data
+# data
 @app.get("/recommendations/{user_name}")
-def get_sample_recommendation(
+def get_recommendation(
     user_name: str,
     destination: Optional[str] = None,
     vibes: str = "",
     budget: Optional[str] = None
 ):
-    """Return recommendations."""
     try:
         with open("data/sample.json", "r") as f:
             data = json.load(f)
         return data
     except Exception as e:
         return {"error": str(e)}
+
 
 # ==========================================================
 #  🔥 SYNC RECOMMENDATIONS — WITH FK VALIDATION
